@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.report_snapshot import report_compat
 from app.store import store
 
 
@@ -59,30 +60,58 @@ class DqReportService(BaseModuleService):
         if quality_values:
             avg_quality = sum(quality_values) / len(quality_values)
 
-        # 写入质量报告记录
-        rows = store.rows(self.MODULE)
-        new_id = max((int(r.get("id", 0)) for r in rows), default=0) + 1
-        report = {
-            "id": new_id,
-            "报告编号": f"DQ_R-{new_id:04d}",
-            "报告周期": period,
-            "覆盖表数": str(len(scorecard_rows)),
-            "通过规则数": str(passed_checks),
-            "失败规则数": str(failed_checks),
-            "趋势分析": "上升" if avg_quality >= 85 else "平稳" if avg_quality >= 70 else "下降",
-            "生成时间": datetime.now(timezone.utc).isoformat(),
-            "报告版本": "v1.0",
-            "status": "已完成",
-            "pending": False,
-            "abnormal": failed_checks > passed_checks,
-        }
-        rows.append(report)
+        # 写入质量报告记录。聚合与快照在同一把锁内完成：
+        # 快照时点取写入之后的 journal_seq，生成这份报告的输入就是快照内容。
+        with store.lock:
+            rows = store.rows(self.MODULE)
+            new_id = max((int(r.get("id", 0)) for r in rows), default=0) + 1
+            report = {
+                "id": new_id,
+                "报告编号": f"DQ_R-{new_id:04d}",
+                "报告周期": period,
+                "覆盖表数": str(len(scorecard_rows)),
+                "通过规则数": str(passed_checks),
+                "失败规则数": str(failed_checks),
+                "趋势分析": "上升" if avg_quality >= 85 else "平稳" if avg_quality >= 70 else "下降",
+                "生成时间": datetime.now(timezone.utc).isoformat(),
+                "报告版本": "v2.0",
+                "结构版本": "v2.0",
+                "status": "已完成",
+                "pending": False,
+                "abnormal": failed_checks > passed_checks,
+            }
+            store.append(self.MODULE, report)
+            snapshot = report_compat.create_runtime_snapshot(
+                report,
+                seq=store.journal_seq(),
+                runtime_metrics={
+                    "覆盖表数": {
+                        "值": report["覆盖表数"],
+                        "来源": {"类型": "聚合计算", "模块": "dq_scorecard", "字段": "评分记录数"},
+                    },
+                    "通过规则数": {
+                        "值": report["通过规则数"],
+                        "来源": {"类型": "聚合计算", "模块": "dq_check_run", "字段": "通过数之和"},
+                    },
+                    "失败规则数": {
+                        "值": report["失败规则数"],
+                        "来源": {"类型": "聚合计算", "模块": "dq_check_run", "字段": "失败数之和"},
+                    },
+                    "趋势分析": {
+                        "值": report["趋势分析"],
+                        "来源": {"类型": "聚合计算", "模块": "dq_trend", "字段": "综合质量均值"},
+                    },
+                },
+                remark="新格式生成时同步产出 v2 快照",
+            )
+        report["快照编号"] = snapshot["快照编号"]
 
         # 计算质量维度得分汇总
         dim_scores = self._compute_dimension_scores(scorecard_rows)
 
         return {
             "报告编号": report["报告编号"],
+            "快照编号": snapshot["快照编号"],
             "报告周期": period,
             "巡检总次数": total_checks,
             "巡检通过率": f"{passed_checks / total_checks * 100:.1f}%" if total_checks > 0 else "N/A",
@@ -122,6 +151,26 @@ class DqReportService(BaseModuleService):
             f"{report.get('报告编号')},{report.get('报告周期')},{report.get('覆盖表数')},{report.get('通过规则数')},{report.get('失败规则数')},{report.get('趋势分析')},{report.get('生成时间')},{report.get('报告版本')}",
         ]
         return "\n".join(lines)
+
+    def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
+        """报告状态流转；“确认完成”同时把确认结果签收进事件回查清单。
+
+        报告行本身仍是通用状态机，但 v2 快照需要独立签收记录，
+        这样事件侧才能按快照定位“哪次确认覆盖了哪些事件”。
+        """
+        entry, message = super().run_action(entry_id, action)
+        if entry is None:
+            return entry, message
+        if action == "确认完成":
+            for snapshot in reversed(report_compat.snapshots_for_entry(entry_id)):
+                if snapshot.get("签收状态") in ("已签收", "已作废"):
+                    continue
+                signed, _ = report_compat.sign_snapshot(
+                    int(snapshot["id"]), result="通过", reviewer="报告确认")
+                if signed is not None:
+                    message = f"{message}，快照 {snapshot['快照编号']} 已签收并同步事件回查清单"
+                    break
+        return entry, message
 
     def domain_snapshot(self) -> dict[str, Any]:
         snapshot = super().domain_snapshot()

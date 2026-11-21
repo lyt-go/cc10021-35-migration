@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.report_snapshot import report_compat
 from app.store import store
 
 
@@ -121,23 +122,48 @@ class DqCheckRunService(BaseModuleService):
             })
 
     def _generate_inspection_report(self, summary: dict[str, Any]) -> None:
-        """聚合巡检结果生成质量报告。"""
-        report_rows = store.rows("dq_report")
-        new_rid = max((int(r.get("id", 0)) for r in report_rows), default=0) + 1
-        report_rows.append({
-            "id": new_rid,
-            "报告编号": f"DQ_R-{new_rid:04d}",
-            "报告周期": f"巡检-{summary['任务编号']}",
-            "覆盖表数": str(len(summary.get("数据范围", "").split(","))),
-            "通过规则数": str(summary["通过数"]),
-            "失败规则数": str(summary["失败数"]),
-            "趋势分析": "首次巡检",
-            "生成时间": datetime.now(timezone.utc).isoformat(),
-            "报告版本": "v1",
-            "status": "已完成",
-            "pending": False,
-            "abnormal": summary["失败数"] > 0,
-        })
+        """聚合巡检结果生成质量报告，并同步产出 v2 报告快照。"""
+        with store.lock:
+            report_rows = store.rows("dq_report")
+            new_rid = max((int(r.get("id", 0)) for r in report_rows), default=0) + 1
+            report = {
+                "id": new_rid,
+                "报告编号": f"DQ_R-{new_rid:04d}",
+                "报告周期": f"巡检-{summary['任务编号']}",
+                "覆盖表数": str(len(summary.get("数据范围", "").split(","))),
+                "通过规则数": str(summary["通过数"]),
+                "失败规则数": str(summary["失败数"]),
+                "趋势分析": "首次巡检",
+                "生成时间": datetime.now(timezone.utc).isoformat(),
+                "报告版本": "v2.0",
+                "结构版本": "v2.0",
+                "status": "已完成",
+                "pending": False,
+                "abnormal": summary["失败数"] > 0,
+            }
+            store.append("dq_report", report)
+            report_compat.create_runtime_snapshot(
+                report,
+                seq=store.journal_seq(),
+                runtime_metrics={
+                    "覆盖表数": {
+                        "值": report["覆盖表数"],
+                        "来源": {"类型": "巡检聚合", "任务编号": summary["任务编号"], "字段": "数据范围"},
+                    },
+                    "通过规则数": {
+                        "值": report["通过规则数"],
+                        "来源": {"类型": "巡检聚合", "任务编号": summary["任务编号"], "字段": "通过数"},
+                    },
+                    "失败规则数": {
+                        "值": report["失败规则数"],
+                        "来源": {"类型": "巡检聚合", "任务编号": summary["任务编号"], "字段": "失败数"},
+                    },
+                    "趋势分析": {
+                        "值": report["趋势分析"],
+                        "来源": {"类型": "首次巡检", "任务编号": summary["任务编号"]},
+                    },
+                },
+            )
 
     def domain_snapshot(self) -> dict[str, Any]:
         snapshot = super().domain_snapshot()

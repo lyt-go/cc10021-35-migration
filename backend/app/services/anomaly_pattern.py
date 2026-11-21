@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.report_snapshot import report_compat
 from app.store import store
 
 
@@ -132,41 +133,66 @@ class AnomalyPatternService(BaseModuleService):
 
     def _report_anomaly_incidents(self, pattern: dict, result: dict, anomaly_count: int) -> None:
         """检测到的异常上报质量事件并聚合到质量报告。"""
-        # 写入质量事件记录
-        incident_rows = store.rows("dq_incident")
-        new_iid = max((int(r.get("id", 0)) for r in incident_rows), default=0) + 1
-        incident_rows.append({
-            "id": new_iid,
-            "事件编号": f"DQ_I-{new_iid:04d}",
-            "关联规则": f"anomaly:{pattern.get('模式编号', '')}",
-            "触发时间": datetime.now(timezone.utc).isoformat(),
-            "偏离程度": result["异常率"],
-            "影响行数": str(anomaly_count),
-            "严重级别": "warning" if anomaly_count > 5 else "info",
-            "处理状态": "自动检测",
-            "处理人": "异常检测引擎",
-            "status": "待确认",
-            "pending": True,
-            "abnormal": True,
-        })
+        with store.lock:
+            # 写入质量事件记录
+            incident_rows = store.rows("dq_incident")
+            new_iid = max((int(r.get("id", 0)) for r in incident_rows), default=0) + 1
+            store.append("dq_incident", {
+                "id": new_iid,
+                "事件编号": f"DQ_I-{new_iid:04d}",
+                "关联规则": f"anomaly:{pattern.get('模式编号', '')}",
+                "触发时间": datetime.now(timezone.utc).isoformat(),
+                "偏离程度": result["异常率"],
+                "影响行数": str(anomaly_count),
+                "严重级别": "warning" if anomaly_count > 5 else "info",
+                "处理状态": "自动检测",
+                "处理人": "异常检测引擎",
+                "status": "待确认",
+                "pending": True,
+                "abnormal": True,
+            })
 
-        # 聚合到质量报告
-        report_rows = store.rows("dq_report")
-        new_rid = max((int(r.get("id", 0)) for r in report_rows), default=0) + 1
-        report_rows.append({
-            "id": new_rid,
-            "报告编号": f"DQ_R-{new_rid:04d}",
-            "报告周期": f"异常检测-{datetime.now(timezone.utc).strftime('%Y%m%d')}",
-            "覆盖表数": "1",
-            "通过规则数": str(max(0, result["检测样本数"] - anomaly_count)),
-            "失败规则数": str(anomaly_count),
-            "趋势分析": "待评估",
-            "生成时间": datetime.now(timezone.utc).isoformat(),
-            "报告版本": "v1",
-            "status": "已完成",
-            "pending": False,
-            "abnormal": anomaly_count > 5,
-        })
+            # 聚合到质量报告，并同步产出 v2 快照
+            report_rows = store.rows("dq_report")
+            new_rid = max((int(r.get("id", 0)) for r in report_rows), default=0) + 1
+            report = {
+                "id": new_rid,
+                "报告编号": f"DQ_R-{new_rid:04d}",
+                "报告周期": f"异常检测-{datetime.now(timezone.utc).strftime('%Y%m%d')}",
+                "覆盖表数": "1",
+                "通过规则数": str(max(0, result["检测样本数"] - anomaly_count)),
+                "失败规则数": str(anomaly_count),
+                "趋势分析": "待评估",
+                "生成时间": datetime.now(timezone.utc).isoformat(),
+                "报告版本": "v2.0",
+                "结构版本": "v2.0",
+                "status": "已完成",
+                "pending": False,
+                "abnormal": anomaly_count > 5,
+            }
+            store.append("dq_report", report)
+            report_compat.create_runtime_snapshot(
+                report,
+                seq=store.journal_seq(),
+                runtime_metrics={
+                    "覆盖表数": {
+                        "值": report["覆盖表数"],
+                        "来源": {"类型": "异常检测", "模式编号": pattern.get("模式编号")},
+                    },
+                    "通过规则数": {
+                        "值": report["通过规则数"],
+                        "来源": {"类型": "异常检测", "字段": "检测样本数-异常点数"},
+                    },
+                    "失败规则数": {
+                        "值": report["失败规则数"],
+                        "来源": {"类型": "异常检测", "字段": "异常点数"},
+                    },
+                    "趋势分析": {
+                        "值": report["趋势分析"],
+                        "来源": {"类型": "异常检测", "字段": "待人工评估"},
+                    },
+                },
+            )
 
     def domain_snapshot(self) -> dict[str, Any]:
         snapshot = super().domain_snapshot()

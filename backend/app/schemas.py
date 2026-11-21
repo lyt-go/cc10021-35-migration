@@ -29,3 +29,25 @@ class EntryPayload(BaseModel):
 class ActionPayload(BaseModel):
     action: str
     remark: str | None = None
+
+
+class ReportMigrationPayload(BaseModel):
+    report_numbers: list[str] | None = None
+    stop_after: int | None = None
+    timepoint: int | None = None
+
+
+class ReportRecomputePayload(BaseModel):
+    metrics: list[str] | None = None
+    reviewer: str = ""
+
+
+class ReportSignPayload(BaseModel):
+    result: str = "通过"
+    reviewer: str = ""
+    remark: str = ""
+
+
+class ReportImportPayload(BaseModel):
+    csv_text: str
+    stop_after: int | None = None

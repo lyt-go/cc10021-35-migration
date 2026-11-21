@@ -56,7 +56,9 @@ class BaseModuleService:
         entry["status"] = self.STATUS_ORDER[0]
         entry["pending"] = True
         entry["abnormal"] = False
-        rows.append(entry)
+        # 通过 store.append 登记，保证事件流水里有这一刻的内容，
+        # 报告快照可以把生成时点固定在这一行上。
+        store.append(self.MODULE, entry)
         return entry, []
 
     def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
@@ -69,6 +71,13 @@ class BaseModuleService:
         entry["status"] = target
         entry["pending"] = target != self.STATUS_ORDER[-1]
         entry["abnormal"] = action in self.NEGATIVE_ACTIONS
+        # 状态流转同样落流水，按序号重建时能拿到流转前/后的准确值。
+        store.record(
+            self.MODULE,
+            entry_id,
+            "update",
+            {"status": entry["status"], "pending": entry["pending"], "abnormal": entry["abnormal"]},
+        )
         return entry, f"{self.ENTITY}已{action}"
 
     def domain_snapshot(self) -> dict[str, Any]:

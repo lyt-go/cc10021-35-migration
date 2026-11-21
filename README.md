@@ -77,5 +77,29 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 质量报告 v1 → v2 兼容
+
+v1 日报只有汇总列（覆盖表数/通过规则数/失败规则数/趋势分析），v2 把它们
+迁成**带来源与结构版本的报告快照**，报告编号保持不变，两种结构可以同时按原编号读取。
+
+- 领域逻辑：`backend/app/services/report_snapshot.py`
+- 路由：`backend/app/routers/report_compat.py`（固定路径排在 `/api/{module}` 之前）
+- 前端核对页：`/report-compat`（`frontend/src/views/ReportCompat.vue`）
+
+关键行为：
+
+| 场景 | 行为 |
+| --- | --- |
+| 存量迁移 | 按“日报日期”回到 `dq_scorecard` / `dq_check_run` / `dq_trend` 找来源；找不到的指标保留原值并标 `存量兼容缺项` |
+| 同一编号多版本 | `GET /api/report/numbers/{报告编号}` 同时返回 v1 汇总行和 v2 快照；`.../effective` 返回实际取得的报告 |
+| 时点隔离 | 快照固定创建时的 `store.journal_seq()`，事件证据用 `store.rows_as_of` 重建，不读取实时状态 |
+| 部署中断 | 逐份提交；`POST /api/report/migrations/{id}/resume` 沿用原数据时点补齐，`/rollback` 作废本次快照并回退 v1 |
+| 签收 | `POST /api/report/snapshots/{id}/sign`，确认结果同步到 `GET /api/report/incident-review` |
+| 逐项重做 | `POST /api/report/snapshots/{id}/recompute` 生成新修订快照，已签快照不可变 |
+| 事件侧回查 | `GET /api/report/incidents/{id}/evidence`、`GET /api/report/daily/{日期}`（含缺来源旧日报） |
+| 跨版本核对样例 | `GET /api/report/fixtures/v1-export` 取一份已导出的 v1 CSV，`POST /api/report/import/v1` 导入并返回按原编号的实际取得报告 |
+
+测试：`backend/tests/test_report_snapshot.py`（`cd backend && .venv/bin/python -m pytest -q`）。
+
 领域：数据工程
 子方向：数仓与数据湖
